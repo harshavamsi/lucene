@@ -65,6 +65,7 @@ import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.DoubleValuesSource;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MultiPhraseQuery;
 import org.apache.lucene.search.MultiTermQuery;
@@ -1434,6 +1435,25 @@ public class TestHighlighter extends BaseTokenStreamTestCase implements Formatte
 
     WeightedSpanTermExtractor extractor = new WeightedSpanTermExtractor();
     extractor.getWeightedSpanTerms(q, 1, new CannedTokenStream(new Token("term", 0, 4)), "field");
+  }
+
+  public void testIndexOrDocValuesExistsQuery() throws IOException {
+    final Query indexQuery = new TermQuery(new Term("field", "foo"));
+    final Query dlvQuery = new TermQuery(new Term("field", "bar"));
+
+    final IndexOrDocValuesQuery iodvq = new IndexOrDocValuesQuery(indexQuery, dlvQuery);
+
+    WeightedSpanTermExtractor extractor =
+        new WeightedSpanTermExtractor() {
+          @Override
+          protected void extract(Query query, float boost, Map<String, WeightedSpanTerm> terms)
+              throws IOException {
+            assertEquals(iodvq, query);
+            super.extract(query, boost, terms);
+          }
+        };
+    extractor.getWeightedSpanTerms(
+        iodvq, 1, new CannedTokenStream(new Token("foo", 0, 3)), "field");
   }
 
   public void testGetBestSingleFragmentWithWeights() throws Exception {
