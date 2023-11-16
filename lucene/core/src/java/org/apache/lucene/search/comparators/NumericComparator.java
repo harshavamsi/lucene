@@ -17,12 +17,12 @@
 
 package org.apache.lucene.search.comparators;
 
-import java.io.IOException;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.PointValues.PointTree;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.FieldComparator;
 import org.apache.lucene.search.LeafFieldComparator;
@@ -31,6 +31,8 @@ import org.apache.lucene.search.Scorer;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.ArrayUtil.ByteArrayComparator;
 import org.apache.lucene.util.DocIdSetBuilder;
+
+import java.io.IOException;
 
 /**
  * Abstract numeric comparator for comparing numeric values. This comparator provides a skipping
@@ -59,7 +61,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
   private boolean canSkipDocuments;
 
   protected NumericComparator(
-      String field, T missingValue, boolean reverse, boolean enableSkipping, int bytesCount) {
+          String field, T missingValue, boolean reverse, boolean enableSkipping, int bytesCount) {
     this.field = field;
     this.missingValue = missingValue;
     this.reverse = reverse;
@@ -101,6 +103,11 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     private int currentSkipInterval = MIN_SKIP_INTERVAL;
     // helps to be conservative about increasing the sampling interval
     private int tryUpdateFailCount = 0;
+    private int numHits = -1;
+
+    private boolean enableReverseSortPruning;
+
+
 
     public NumericLeafComparator(LeafReaderContext context) throws IOException {
       this.docValues = getNumericDocValues(context, field);
@@ -109,26 +116,27 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         FieldInfo info = context.reader().getFieldInfos().fieldInfo(field);
         if (info == null || info.getPointDimensionCount() == 0) {
           throw new IllegalStateException(
-              "Field "
-                  + field
-                  + " doesn't index points according to FieldInfos yet returns non-null PointValues");
+                  "Field "
+                          + field
+                          + " doesn't index points according to FieldInfos yet returns non-null PointValues");
         } else if (info.getPointDimensionCount() > 1) {
           throw new IllegalArgumentException(
-              "Field " + field + " is indexed with multiple dimensions, sorting is not supported");
+                  "Field " + field + " is indexed with multiple dimensions, sorting is not supported");
         } else if (info.getPointNumBytes() != bytesCount) {
           throw new IllegalArgumentException(
-              "Field "
-                  + field
-                  + " is indexed with "
-                  + info.getPointNumBytes()
-                  + " bytes per dimension, but "
-                  + NumericComparator.this
-                  + " expected "
-                  + bytesCount);
+                  "Field "
+                          + field
+                          + " is indexed with "
+                          + info.getPointNumBytes()
+                          + " bytes per dimension, but "
+                          + NumericComparator.this
+                          + " expected "
+                          + bytesCount);
         }
         this.enableSkipping = true; // skipping is enabled when points are available
         this.maxDoc = context.reader().maxDoc();
         this.competitiveIterator = DocIdSetIterator.all(maxDoc);
+        this.enableReverseSortPruning = true;
       } else {
         this.enableSkipping = false;
         this.maxDoc = 0;
@@ -148,7 +156,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
      * @throws IOException If there is a low-level I/O error
      */
     protected NumericDocValues getNumericDocValues(LeafReaderContext context, String field)
-        throws IOException {
+            throws IOException {
       return DocValues.getNumeric(context.reader(), field);
     }
 
@@ -165,12 +173,20 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     @Override
     public void setScorer(Scorable scorer) throws IOException {
+      this.setScorer(scorer, -1);
+    }
+
+    @Override
+    public void setScorer(Scorable scorer, int numHits) throws IOException {
       if (iteratorCost == -1) {
         if (scorer instanceof Scorer) {
           iteratorCost =
-              ((Scorer) scorer).iterator().cost(); // starting iterator cost is the scorer's cost
+                  ((Scorer) scorer).iterator().cost(); // starting iterator cost is the scorer's cost
         } else {
           iteratorCost = maxDoc;
+        }
+        if (numHits != -1) {
+          this.numHits = numHits;
         }
         updateCompetitiveIterator(); // update an iterator when we have a new segment
       }
@@ -186,8 +202,8 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     // entry
     private void updateCompetitiveIterator() throws IOException {
       if (enableSkipping == false
-          || hitsThresholdReached == false
-          || (queueFull == false && topValueSet == false)) return;
+              || hitsThresholdReached == false
+              || (queueFull == false && topValueSet == false)) return;
       // if some documents have missing points, check that missing values prohibits optimization
       if ((pointValues.getDocCount() < maxDoc) && isMissingValueCompetitive()) {
         return; // we can't filter out documents, as documents with missing values are competitive
@@ -196,7 +212,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       updateCounter++;
       // Start sampling if we get called too much
       if (updateCounter > 256
-          && (updateCounter & (currentSkipInterval - 1)) != currentSkipInterval - 1) {
+              && (updateCounter & (currentSkipInterval - 1)) != currentSkipInterval - 1) {
         return;
       }
       if (reverse == false) {
@@ -219,79 +235,197 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         }
       }
 
+
+      final int[] nonCompetitiveDocsToSkip = {-1};
+      final int[] competitiveDocsCollected = {0};
+
       DocIdSetBuilder result = new DocIdSetBuilder(maxDoc);
       PointValues.IntersectVisitor visitor =
-          new PointValues.IntersectVisitor() {
-            DocIdSetBuilder.BulkAdder adder;
+              new PointValues.IntersectVisitor() {
+                DocIdSetBuilder.BulkAdder adder;
 
-            @Override
-            public void grow(int count) {
-              adder = result.grow(count);
-            }
+                @Override
+                public void grow(int count) {
+                  adder = result.grow(count);
+                }
 
-            @Override
-            public void visit(int docID) {
-              if (docID <= maxDocVisited) {
-                return; // Already visited or skipped
-              }
-              adder.add(docID);
-            }
+                @Override
+                public void visit(int docID) {
+                  if (nonCompetitiveDocsToSkip[0] > 0) {
+                    nonCompetitiveDocsToSkip[0] -= 1;
+                    return;
+                  }
 
-            @Override
-            public void visit(int docID, byte[] packedValue) {
-              if (docID <= maxDocVisited) {
-                return; // already visited or skipped
-              }
-              if (maxValueAsBytes != null) {
-                int cmp = bytesComparator.compare(packedValue, 0, maxValueAsBytes, 0);
-                // if doc's value is too high or for single sort even equal, it is not competitive
-                // and the doc can be skipped
-                if (cmp > 0 || (singleSort && cmp == 0)) return;
-              }
-              if (minValueAsBytes != null) {
-                int cmp = bytesComparator.compare(packedValue, 0, minValueAsBytes, 0);
-                // if doc's value is too low or for single sort even equal, it is not competitive
-                // and the doc can be skipped
-                if (cmp < 0 || (singleSort && cmp == 0)) return;
-              }
-              adder.add(docID); // doc is competitive
-            }
+                  if (docID <= maxDocVisited) {
+                    return; // Already visited or skipped
+                  }
+                  adder.add(docID);
+                  competitiveDocsCollected[0] += 1;
+                }
 
-            @Override
-            public PointValues.Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
-              if (maxValueAsBytes != null) {
-                int cmp = bytesComparator.compare(minPackedValue, 0, maxValueAsBytes, 0);
-                if (cmp > 0 || (singleSort && cmp == 0))
-                  return PointValues.Relation.CELL_OUTSIDE_QUERY;
-              }
-              if (minValueAsBytes != null) {
-                int cmp = bytesComparator.compare(maxPackedValue, 0, minValueAsBytes, 0);
-                if (cmp < 0 || (singleSort && cmp == 0))
-                  return PointValues.Relation.CELL_OUTSIDE_QUERY;
-              }
-              if ((maxValueAsBytes != null
-                      && bytesComparator.compare(maxPackedValue, 0, maxValueAsBytes, 0) > 0)
-                  || (minValueAsBytes != null
-                      && bytesComparator.compare(minPackedValue, 0, minValueAsBytes, 0) < 0)) {
-                return PointValues.Relation.CELL_CROSSES_QUERY;
-              }
-              return PointValues.Relation.CELL_INSIDE_QUERY;
-            }
-          };
+                @Override
+                public void visit(int docID, byte[] packedValue) {
+                  if (nonCompetitiveDocsToSkip[0] > 0) {
+                    nonCompetitiveDocsToSkip[0] -= 1;
+                    return;
+                  }
+
+                  if (docID <= maxDocVisited) {
+                    return; // already visited or skipped
+                  }
+                  if (maxValueAsBytes != null) {
+                    int cmp = bytesComparator.compare(packedValue, 0, maxValueAsBytes, 0);
+                    // if doc's value is too high or for single sort even equal, it is not competitive
+                    // and the doc can be skipped
+                    if (cmp > 0 || (singleSort && cmp == 0)) return;
+                  }
+                  if (minValueAsBytes != null) {
+                    int cmp = bytesComparator.compare(packedValue, 0, minValueAsBytes, 0);
+                    // if doc's value is too low or for single sort even equal, it is not competitive
+                    // and the doc can be skipped
+                    if (cmp < 0 || (singleSort && cmp == 0)) return;
+                  }
+                  adder.add(docID); // doc is competitive
+                  competitiveDocsCollected[0] += 1;
+                }
+
+                @Override
+                public PointValues.Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
+                  return getRelation(minPackedValue, maxPackedValue);
+                }
+              };
       final long threshold = iteratorCost >>> 3;
-      long estimatedNumberOfMatches =
-          pointValues.estimatePointCount(visitor); // runs in O(log(numPoints))
-      if (estimatedNumberOfMatches >= threshold) {
-        // the new range is not selective enough to be worth materializing, it doesn't reduce number
-        // of docs at least 8x
-        updateSkipInterval(false);
-        return;
+
+      if (enableReverseSortPruning && reverse && numHits > 0 && numHits < threshold) {
+        // We want to find last N elements in BKD since those would be most competitive.
+        // Unfortunately, we cannot
+        // traverse BKD in reverse order, so first find all the competitive documents in the segment
+        // matching the
+        // criteria and then deduct the numHits which would represent number of documents to skip
+        // (no more competitive)
+        // and then start collecting docs. Finding all the competitive documents in the segment is
+        // heavy duty, we want
+        // to avoid reading doc values to make it light weight. Inner matching nodes of BKDs
+        // contains all competitive docs
+        // thus they can be blindly accepted. Leaf nodes where node cell crosses query contains both
+        // competitive and
+        // non-competitive docs where doc values are required, we can assume them non-competitive
+        // and find the lower bound
+        // of competitive documents in the segment. It will be skipping little lesser number of
+        // competitive documents, but still
+        // competitiveDocs left to be collected after discarding these are more than numHits
+
+        CardinalityVisitor cardinalityVisitor = new CardinalityVisitor();
+        // this can be expensive operation so should be restricted to be only used once per segment
+        intersectLowerBound(cardinalityVisitor, pointValues.getPointTree());
+        int lowerBoundCompetitiveDocs = cardinalityVisitor.getVisitedCount();
+        nonCompetitiveDocsToSkip[0] = lowerBoundCompetitiveDocs - numHits;
+
+        competitiveDocsCollected[0] = 0;
+        // don't collect nonCompetitiveDocsToPass and start collecting when nonCompetitiveDocsToPass
+        // is exhausted
+        pointValues.intersect(visitor);
+        if (competitiveDocsCollected[0] >= threshold) {
+          updateSkipInterval(false);
+          enableReverseSortPruning = false; // we only check once per segment
+          return;
+        }
+      } else {
+        long estimatedNumberOfMatches =
+                pointValues.estimatePointCount(visitor); // runs in O(log(numPoints))
+        if (estimatedNumberOfMatches >= threshold) {
+          // the new range is not selective enough to be worth materializing, it doesn't reduce
+          // number
+          // of docs at least 8x
+          updateSkipInterval(false);
+          return;
+        }
+        pointValues.intersect(visitor);
       }
       pointValues.intersect(visitor);
       competitiveIterator = result.build().iterator();
       iteratorCost = competitiveIterator.cost();
       updateSkipInterval(true);
     }
+
+    private PointValues.Relation getRelation(byte[] minPackedValue, byte[] maxPackedValue) {
+      if (maxValueAsBytes != null) {
+        int cmp = bytesComparator.compare(minPackedValue, 0, maxValueAsBytes, 0);
+        if (cmp > 0 || (singleSort && cmp == 0)) return PointValues.Relation.CELL_OUTSIDE_QUERY;
+      }
+      if (minValueAsBytes != null) {
+        int cmp = bytesComparator.compare(maxPackedValue, 0, minValueAsBytes, 0);
+        if (cmp < 0 || (singleSort && cmp == 0)) return PointValues.Relation.CELL_OUTSIDE_QUERY;
+      }
+      if ((maxValueAsBytes != null
+              && bytesComparator.compare(maxPackedValue, 0, maxValueAsBytes, 0) > 0)
+              || (minValueAsBytes != null
+              && bytesComparator.compare(minPackedValue, 0, minValueAsBytes, 0) < 0)) {
+        return PointValues.Relation.CELL_CROSSES_QUERY;
+      }
+      return PointValues.Relation.CELL_INSIDE_QUERY;
+    }
+
+    /**
+     * Visits all documents which are strictly in the range with respect to relation defined in
+     * visitor. Doesn't fetch the doc values to compare, so faster than {@link
+     * PointTree#intersect(PointValues.IntersectVisitor)}. This is slower than {@link
+     * PointValues#estimateDocCount(PointValues.IntersectVisitor)}.
+     *
+     * @param visitor CardinalityVisitor to comput the lower bound of matching documents
+     * @param pointTree uses the current node pointTree is at to search
+     */
+    private void intersectLowerBound(CardinalityVisitor visitor, PointTree pointTree)
+            throws IOException {
+      PointValues.Relation r =
+              visitor.compare(pointTree.getMinPackedValue(), pointTree.getMaxPackedValue());
+      switch (r) {
+        case CELL_OUTSIDE_QUERY:
+          break;
+        case CELL_INSIDE_QUERY:
+          pointTree.visitDocIDs(visitor);
+          break;
+        case CELL_CROSSES_QUERY:
+          if (pointTree.moveToChild()) {
+            do {
+              intersectLowerBound(visitor, pointTree);
+            } while (pointTree.moveToSibling());
+            pointTree.moveToParent();
+          } else {
+            // do nothing as we are finding lower bound of no of matches and will assume none of
+            // documents are matching
+            // leaf node crosses the query
+          }
+          break;
+        default:
+          throw new IllegalArgumentException("Unreachable code");
+      }
+    }
+
+    private class CardinalityVisitor implements PointValues.IntersectVisitor {
+      int visitedCount = 0;
+
+      @Override
+      public void visit(int docID) {
+        visitedCount += 1;
+      }
+
+      @Override
+      public void visit(int docID, byte[] packedValue) {
+        throw new IllegalStateException();
+      }
+
+      @Override
+      public PointValues.Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
+        return getRelation(minPackedValue, maxPackedValue);
+      }
+
+      public int getVisitedCount() {
+        return visitedCount;
+      }
+    }
+
+
 
     private void updateSkipInterval(boolean success) {
       if (updateCounter > 256) {
@@ -366,3 +500,4 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     protected abstract void encodeTop(byte[] packedValue);
   }
 }
+

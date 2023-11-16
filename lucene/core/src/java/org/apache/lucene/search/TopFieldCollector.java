@@ -27,6 +27,7 @@ import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.FieldValueHitQueue.Entry;
 import org.apache.lucene.search.MaxScoreAccumulator.DocAndScore;
 import org.apache.lucene.search.TotalHits.Relation;
+import org.apache.lucene.search.comparators.NumericComparator;
 
 /**
  * A {@link Collector} that sorts by {@link SortField} using {@link FieldComparator}s.
@@ -133,7 +134,11 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
     @Override
     public void setScorer(Scorable scorer) throws IOException {
       this.scorer = scorer;
-      comparator.setScorer(scorer);
+      if (comparator instanceof NumericComparator) {
+        comparator.setScorer(scorer, numHits);
+      } else {
+        comparator.setScorer(scorer);
+      }
       if (minScoreAcc == null) {
         updateMinCompetitiveScore(scorer);
       } else {
