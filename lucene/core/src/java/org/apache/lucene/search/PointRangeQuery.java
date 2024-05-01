@@ -214,6 +214,61 @@ public abstract class PointRangeQuery extends Query {
         };
       }
 
+      private IntersectVisitor getSmallIntersectVisitor(DocIdSetBuilder result, int size) {
+        return new IntersectVisitor() {
+          int docCount = 0;
+
+          DocIdSetBuilder.BulkAdder adder;
+
+          @Override
+          public void grow(int count) {
+            adder = result.grow(count);
+          }
+
+          @Override
+          public void visit(int docID) {
+            if (docCount < size) {
+              adder.add(docID);
+              docCount++;
+            }
+          }
+
+          @Override
+          public void visit(DocIdSetIterator iterator) throws IOException {
+            int docID;
+            while ((docID = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+              visit(docID);
+            }
+          }
+
+          @Override
+          public void visit(IntsRef ref) {
+            for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+              adder.add(ref.ints[i]);
+            }
+          }
+
+          @Override
+          public void visit(int docID, byte[] packedValue) {
+            if (matches(packedValue)) {
+              visit(docID);
+            }
+          }
+
+          @Override
+          public void visit(DocIdSetIterator iterator, byte[] packedValue) throws IOException {
+            if (matches(packedValue)) {
+              adder.add(iterator);
+            }
+          }
+
+          @Override
+          public Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
+            return relate(minPackedValue, maxPackedValue);
+          }
+        };
+      }
+
       /** Create a visitor that clears documents that do NOT match the range. */
       private IntersectVisitor getInverseIntersectVisitor(FixedBitSet result, long[] cost) {
         return new IntersectVisitor() {
@@ -360,7 +415,8 @@ public abstract class PointRangeQuery extends Query {
           return new ScorerSupplier() {
 
             final DocIdSetBuilder result = new DocIdSetBuilder(reader.maxDoc(), values, field);
-            final IntersectVisitor visitor = getIntersectVisitor(result);
+//            final IntersectVisitor visitor = getIntersectVisitor(result);
+            final IntersectVisitor smallVisitor = getSmallIntersectVisitor(result, 1000);
             long cost = -1;
 
             @Override
@@ -379,7 +435,7 @@ public abstract class PointRangeQuery extends Query {
                 return new ConstantScoreScorer(weight, score(), scoreMode, iterator);
               }
 
-              values.intersect(visitor);
+              values.intersect(smallVisitor);
               DocIdSetIterator iterator = result.build().iterator();
               return new ConstantScoreScorer(weight, score(), scoreMode, iterator);
             }
@@ -388,7 +444,7 @@ public abstract class PointRangeQuery extends Query {
             public long cost() {
               if (cost == -1) {
                 // Computing the cost may be expensive, so only do it if necessary
-                cost = values.estimateDocCount(visitor);
+                cost = values.estimateDocCount(smallVisitor);
                 assert cost >= 0;
               }
               return cost;

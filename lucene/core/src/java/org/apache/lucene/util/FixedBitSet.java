@@ -413,6 +413,7 @@ public final class FixedBitSet extends BitSet {
     } else {
       checkUnpositioned(iter);
       for (int doc = iter.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = iter.nextDoc()) {
+        System.out.println(doc);
         clear(doc);
       }
     }
