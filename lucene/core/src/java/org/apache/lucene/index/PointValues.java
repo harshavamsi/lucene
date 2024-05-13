@@ -349,6 +349,16 @@ public abstract class PointValues {
     assert pointTree.moveToParent() == false;
   }
 
+  /**
+   * Finds all documents and points matching the provided visitor. This method does not enforce live
+   * documents, so it's up to the caller to test whether each document is deleted, if necessary.
+   */
+  public final void intersect(IntersectVisitor visitor, int count) throws IOException {
+    final PointTree pointTree = getPointTree();
+    intersect(visitor, pointTree, count, 0);
+    assert pointTree.moveToParent() == false;
+  }
+
   private void intersect(IntersectVisitor visitor, PointTree pointTree) throws IOException {
     Relation r = visitor.compare(pointTree.getMinPackedValue(), pointTree.getMaxPackedValue());
     switch (r) {
@@ -378,6 +388,44 @@ public abstract class PointValues {
       default:
         throw new IllegalArgumentException("Unreachable code");
     }
+  }
+
+  private long intersect(IntersectVisitor visitor, PointTree pointTree, int count, long docCount) throws IOException {
+    Relation r = visitor.compare(pointTree.getMinPackedValue(), pointTree.getMaxPackedValue());
+    if (docCount >= count) {
+      return 0;
+    }
+    switch (r) {
+      case CELL_OUTSIDE_QUERY:
+        // This cell is fully outside the query shape: stop recursing
+        break;
+      case CELL_INSIDE_QUERY:
+        // This cell is fully inside the query shape: recursively add all points in this cell
+        // without filtering
+        pointTree.visitDocIDs(visitor);
+        return pointTree.size();
+      case CELL_CROSSES_QUERY:
+        // The cell crosses the shape boundary, or the cell fully contains the query, so we fall
+        // through and do full filtering:
+        if (pointTree.moveToChild()) {
+          do {
+            docCount += intersect(visitor, pointTree, count, docCount);
+          } while (pointTree.moveToSibling() && docCount <= count);
+          pointTree.moveToParent();
+        } else {
+          // TODO: we can assert that the first value here in fact matches what the pointTree
+          // claimed?
+          // Leaf node; scan and filter all points in this block:
+          if (docCount <= count) {
+            pointTree.visitDocValues(visitor);
+          }
+          else break;
+        }
+        break;
+      default:
+        throw new IllegalArgumentException("Unreachable code");
+    }
+    return pointTree.size();
   }
 
   /**
