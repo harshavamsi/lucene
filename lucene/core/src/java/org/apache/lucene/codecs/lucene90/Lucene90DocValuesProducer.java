@@ -1387,6 +1387,20 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               advance(upTo);
             }
           }
+
+          @Override
+          public void ordValues(
+              int size, int[] docs, int docsOffset, int[] ords, int ordsOffset, int defaultOrd)
+              throws IOException {
+            // Dense single-block packed ordinals: random-access decode with no per-doc
+            // advanceExact/ordValue virtual dispatch.
+            for (int i = 0; i < size; ++i) {
+              ords[ordsOffset + i] = (int) values.get(docs[docsOffset + i]);
+            }
+            if (size != 0) {
+              doc = docs[docsOffset + size - 1];
+            }
+          }
         };
       } else if (ordsEntry.docsWithFieldOffset >= 0) { // sparse but non-empty
         final IndexedDISI disi =
@@ -1446,9 +1460,26 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     final NumericDocValues ords = getNumeric(entry.ordsEntry);
     return new BaseSortedDocValues(entry) {
 
+      private long[] bulkOrds = new long[0];
+
       @Override
       public int ordValue() throws IOException {
         return (int) ords.longValue();
+      }
+
+      @Override
+      public void ordValues(
+          int size, int[] docs, int docsOffset, int[] ords2, int ordsOffset, int defaultOrd)
+          throws IOException {
+        // Delegate to the wrapped NumericDocValues' bulk decode (possibly SIMD byte-aligned),
+        // then narrow to int.
+        if (bulkOrds.length < size) {
+          bulkOrds = new long[size];
+        }
+        ords.longValues(size, docs, docsOffset, bulkOrds, 0, defaultOrd);
+        for (int i = 0; i < size; ++i) {
+          ords2[ordsOffset + i] = (int) bulkOrds[i];
+        }
       }
 
       @Override

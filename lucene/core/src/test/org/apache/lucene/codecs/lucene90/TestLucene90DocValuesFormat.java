@@ -277,6 +277,108 @@ public class TestLucene90DocValuesFormat extends BaseCompressingDocValuesFormatT
     }
   }
 
+  public void testSortedOrdValuesBulkFetch() throws Exception {
+    // Vary unique-value count to exercise different bitsPerValue encodings of the ordinals,
+    // including the byte-aligned widths that take the SIMD bulk-decode path.
+    doTestSortedOrdValuesBulkFetch(2, true);
+    doTestSortedOrdValuesBulkFetch(200, true);
+    doTestSortedOrdValuesBulkFetch(500, true);
+    doTestSortedOrdValuesBulkFetch(2, false);
+    doTestSortedOrdValuesBulkFetch(200, false);
+    doTestSortedOrdValuesBulkFetch(500, false);
+  }
+
+  private void doTestSortedOrdValuesBulkFetch(int numValues, boolean dense) throws Exception {
+    final int numDocs = 512;
+    Directory dir = newDirectory();
+    IndexWriterConfig conf = new IndexWriterConfig(new MockAnalyzer(random()));
+    conf.setMergeScheduler(new SerialMergeScheduler());
+    IndexWriter writer = new IndexWriter(dir, conf);
+    for (int i = 0; i < numDocs; i++) {
+      Document doc = new Document();
+      if (dense || random().nextInt(4) != 0) {
+        int v = random().nextInt(numValues);
+        doc.add(new SortedDocValuesField("sorted", new BytesRef(String.format("%05d", v))));
+      }
+      writer.addDocument(doc);
+    }
+    writer.forceMerge(1);
+
+    try (DirectoryReader reader = DirectoryReader.open(writer)) {
+      LeafReader leaf = reader.leaves().get(0).reader();
+      // Fresh iterators per assertion: ordValues advances the iterator, and doc IDs must be
+      // consumed in ascending order across calls.
+      assertBulkOrdValues(
+          leaf.getSortedDocValues("sorted"),
+          leaf.getSortedDocValues("sorted"),
+          leaf.getSortedDocValues("sorted"),
+          0,
+          128,
+          1);
+      assertBulkOrdValues(
+          leaf.getSortedDocValues("sorted"),
+          leaf.getSortedDocValues("sorted"),
+          leaf.getSortedDocValues("sorted"),
+          17,
+          128,
+          1);
+      assertBulkOrdValues(
+          leaf.getSortedDocValues("sorted"),
+          leaf.getSortedDocValues("sorted"),
+          leaf.getSortedDocValues("sorted"),
+          0,
+          128,
+          2);
+    }
+
+    writer.close();
+    dir.close();
+  }
+
+  private static void assertBulkOrdValues(
+      SortedDocValues values,
+      SortedDocValues offsetValues,
+      SortedDocValues singleValues,
+      int startDoc,
+      int size,
+      int docStep)
+      throws IOException {
+    int[] docs = new int[size];
+    int[] actual = new int[size];
+    for (int i = 0; i < size; i++) {
+      docs[i] = startDoc + i * docStep;
+    }
+
+    values.ordValues(size, docs, actual, -1);
+    if (size != 0) {
+      assertEquals(docs[size - 1], values.docID());
+    }
+    for (int i = 0; i < size; i++) {
+      int expectedOrd = singleValues.advanceExact(docs[i]) ? singleValues.ordValue() : -1;
+      assertEquals("doc=" + docs[i] + " startDoc=" + startDoc, expectedOrd, actual[i]);
+    }
+
+    // Verify offset-aware variant produces identical results. Uses a fresh iterator: the plain
+    // call above already advanced `values`, and doc IDs must be consumed in ascending order.
+    if (size > 2) {
+      int docsOffset = 1;
+      int sliceSize = size - 2;
+      int[] offsetActual = new int[sliceSize + 4];
+      int ordsOffset = 2;
+      Arrays.fill(offsetActual, Integer.MIN_VALUE);
+      offsetValues.ordValues(sliceSize, docs, docsOffset, offsetActual, ordsOffset, -1);
+      for (int i = 0; i < sliceSize; i++) {
+        assertEquals(
+            "offset variant mismatch at i=" + i,
+            actual[docsOffset + i],
+            offsetActual[ordsOffset + i]);
+      }
+      assertEquals(Integer.MIN_VALUE, offsetActual[0]);
+      assertEquals(Integer.MIN_VALUE, offsetActual[1]);
+      assertEquals(Integer.MIN_VALUE, offsetActual[ordsOffset + sliceSize]);
+    }
+  }
+
   private void doTestSparseDocValuesVsStoredFields() throws Exception {
     final long[] values = new long[TestUtil.nextInt(random(), 1, 500)];
     for (int i = 0; i < values.length; ++i) {
