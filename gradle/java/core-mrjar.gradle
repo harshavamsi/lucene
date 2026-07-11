@@ -51,6 +51,37 @@ configure(project(":lucene:core")) {
       }
     }
     
+    // Compile the main and test source sets against the JDK 21 API jar (same patching as
+    // compileMain21Java above) so that java.lang.foreign types (MemorySegment) can be used
+    // in the public API without preview flags. Class files get the toolchain's class-file
+    // version instead of the --release one, which is acceptable for this fork.
+    ["compileJava", "compileTestJava"].each { taskName ->
+      tasks.named(taskName).configure {
+        def apijar = apijars.file("jdk21.apijar")
+
+        int releaseIndex = options.compilerArgs.indexOf("--release")
+        options.compilerArgs.removeAt(releaseIndex)
+        options.compilerArgs.removeAt(releaseIndex)
+
+        options.compilerArgs.removeAll("-Xlint:options")
+
+        options.compilerArgs += [
+          "-Xlint:-options",
+          "--add-exports", "java.base/java.lang.foreign=ALL-UNNAMED",
+        ]
+
+        def argsProvider = objects.newInstance(CompilerArgsProvider)
+        argsProvider.apiJarFile.set(apijar)
+        options.compilerArgumentProviders.add(argsProvider)
+      }
+    }
+
+    // The main source set now references java.lang.foreign types, which are preview at
+    // --release 21; enable preview for javadoc rendering of this module only.
+    tasks.matching { it.name == "renderJavadoc" || it.name == "renderSiteJavadoc" }.configureEach {
+      extraOpts.add("--enable-preview")
+    }
+
     tasks.named('jar').configure {
       boolean needMRJAR = false;
       mrjarJavaVersions.each { jdkVersion ->

@@ -21,6 +21,9 @@ import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.SKIP_IND
 import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.TERMS_DICT_BLOCK_LZ4_SHIFT;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesProducer;
@@ -587,6 +590,35 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     return bytes;
   }
 
+  private static final ValueLayout.OfLong LONG_LE =
+      ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+  private static boolean bulkDecodeByteAlignedValuesToSegment(
+      RandomAccessInput slice,
+      NumericEntry entry,
+      int size,
+      int[] docs,
+      int docsOffset,
+      MemorySegment dst,
+      long dstByteOffset)
+      throws IOException {
+    if (canBulkDecodeByteAligned(entry) == false || isContiguous(size, docs, docsOffset) == false) {
+      return false;
+    }
+    if (size == 0) {
+      return true;
+    }
+    final int bytesPerValue = entry.bitsPerValue / Byte.SIZE;
+    final long srcByteOffset = (long) docs[docsOffset] * bytesPerValue;
+    // The segment decode never reads past srcByteOffset + size * bytesPerValue (tail elements
+    // are assembled byte-by-byte), so no padding bytes are required.
+    if (srcByteOffset + (long) size * bytesPerValue > slice.length()) {
+      return false;
+    }
+    return DOC_VALUES_BULK_DECODE_SUPPORT.decodeByteAlignedToSegment(
+        slice, srcByteOffset, entry.bitsPerValue, dst, dstByteOffset, size);
+  }
+
   private static void applyTable(long[] values, int valuesOffset, long[] table, int size) {
     for (int i = valuesOffset, end = valuesOffset + size; i < end; i++) {
       values[i] = table[(int) values[i]];
@@ -807,6 +839,24 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               doc = docs[docsOffset + size - 1];
             }
           }
+
+          @Override
+          public boolean longValuesInto(
+              int size,
+              int[] docs,
+              int docsOffset,
+              MemorySegment dst,
+              long dstByteOffset,
+              long defaultValue)
+              throws IOException {
+            for (int i = 0; i < size; i++) {
+              dst.set(LONG_LE, dstByteOffset + i * 8L, entry.minValue);
+            }
+            if (size != 0) {
+              doc = docs[docsOffset + size - 1];
+            }
+            return true;
+          }
         };
       } else {
         final RandomAccessInput slice =
@@ -906,6 +956,25 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                     doc = docs[docsOffset + size - 1];
                   }
                 }
+              }
+
+              @Override
+              public boolean longValuesInto(
+                  int size,
+                  int[] docs,
+                  int docsOffset,
+                  MemorySegment dst,
+                  long dstByteOffset,
+                  long defaultValue)
+                  throws IOException {
+                if (bulkDecodeByteAlignedValuesToSegment(
+                    slice, entry, size, docs, docsOffset, dst, dstByteOffset)) {
+                  if (size != 0) {
+                    doc = docs[docsOffset + size - 1];
+                  }
+                  return true;
+                }
+                return false;
               }
 
               @Override

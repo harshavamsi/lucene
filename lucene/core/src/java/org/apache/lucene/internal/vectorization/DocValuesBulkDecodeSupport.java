@@ -16,6 +16,9 @@
  */
 package org.apache.lucene.internal.vectorization;
 
+import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.LongValues;
 
 /**
@@ -42,4 +45,29 @@ public interface DocValuesBulkDecodeSupport {
    */
   void decodeByteAligned(
       byte[] bytes, int bytesOffset, int bitsPerValue, long[] values, int valuesOffset, int count);
+
+  /**
+   * Decodes {@code count} byte-aligned packed values read from {@code slice} at {@code
+   * srcByteOffset} directly into {@code dst} at {@code dstByteOffset} as 64-bit little-endian longs
+   * (zero-extended). Returns false when unsupported (e.g. the slice is not backed by a {@code
+   * MemorySegment}); callers must then fall back to the heap path.
+   *
+   * @param slice source of the packed values
+   * @param srcByteOffset first byte to read in {@code slice}
+   * @param bitsPerValue number of bits per value, must be a multiple of 8
+   * @param dst destination memory segment
+   * @param dstByteOffset first byte to write in {@code dst}
+   * @param count number of values to decode
+   * @return true if the decode was performed, false if the caller must fall back
+   */
+  default boolean decodeByteAlignedToSegment(
+      RandomAccessInput slice,
+      long srcByteOffset,
+      int bitsPerValue,
+      MemorySegment dst,
+      long dstByteOffset,
+      int count)
+      throws IOException {
+    return false;
+  }
 }

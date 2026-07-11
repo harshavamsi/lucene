@@ -17,6 +17,10 @@
 package org.apache.lucene.codecs.lucene90;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -64,11 +68,13 @@ import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.TermsEnum.SeekStatus;
 import org.apache.lucene.store.ByteBuffersDataInput;
 import org.apache.lucene.store.ByteBuffersDataOutput;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.FilterIndexInput;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.tests.analysis.MockAnalyzer;
 import org.apache.lucene.tests.codecs.asserting.AssertingCodec;
 import org.apache.lucene.tests.index.BaseCompressingDocValuesFormatTestCase;
@@ -274,6 +280,183 @@ public class TestLucene90DocValuesFormat extends BaseCompressingDocValuesFormatT
       assertEquals(Long.MIN_VALUE, offsetActual[0]);
       assertEquals(Long.MIN_VALUE, offsetActual[1]);
       assertEquals(Long.MIN_VALUE, offsetActual[valuesOffset + sliceSize]);
+    }
+  }
+
+  private static final ValueLayout.OfLong SEGMENT_LONG_LE =
+      ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+  public void testDenseNumericLongValuesIntoSegment() throws Exception {
+    doTestDenseNumericLongValuesIntoSegment(8);
+    doTestDenseNumericLongValuesIntoSegment(16);
+    doTestDenseNumericLongValuesIntoSegment(24);
+    doTestDenseNumericLongValuesIntoSegment(32);
+    doTestDenseNumericLongValuesIntoSegment(40);
+    doTestDenseNumericLongValuesIntoSegment(48);
+    doTestDenseNumericLongValuesIntoSegment(56);
+    doTestDenseNumericLongValuesIntoSegment(64);
+  }
+
+  private void doTestDenseNumericLongValuesIntoSegment(int bitsPerValue) throws Exception {
+    final int numDocs = 512;
+    final long[] expected = new long[numDocs];
+    // Keep values non-negative so the encoder stores them raw (minValue == 0, gcd == 1), the
+    // only dense branch that supports the direct segment decode. Negative values would take the
+    // gcd/delta branch, which falls back.
+    final long mask = bitsPerValue == 64 ? Long.MAX_VALUE : (1L << bitsPerValue) - 1;
+    for (int i = 0; i < numDocs; i++) {
+      expected[i] = random().nextLong() & mask;
+    }
+
+    // Use an explicit MMapDirectory so the doc values data is backed by a MemorySegment and the
+    // direct segment decode path can engage (newDirectory() may return a heap directory).
+    try (Directory dir = new MMapDirectory(createTempDir("longValuesInto-" + bitsPerValue))) {
+      IndexWriterConfig conf = new IndexWriterConfig(new MockAnalyzer(random()));
+      conf.setMergeScheduler(new SerialMergeScheduler());
+      IndexWriter writer = new IndexWriter(dir, conf);
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new NumericDocValuesField("numeric", expected[i]));
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        // Contiguous batches: whether the segment decode engages depends on the active
+        // vectorization provider; either way results must match per-doc access.
+        assertLongValuesInto(leaf, bitsPerValue, 0, 128, 1, 0);
+        assertLongValuesInto(leaf, bitsPerValue, 17, 128, 1, 0);
+        assertLongValuesInto(leaf, bitsPerValue, 5, 100, 1, 16);
+        // Batch ending at the very last doc: exercises the slice tail handling.
+        assertLongValuesInto(leaf, bitsPerValue, numDocs - 64, 64, 1, 0);
+        // Non-contiguous docs must always return false and fall back.
+        assertLongValuesInto(leaf, bitsPerValue, 0, 128, 2, 0);
+      }
+      writer.close();
+    }
+  }
+
+  /**
+   * Calls longValuesInto for the given batch. When the decode is performed, verifies the segment
+   * contents and iterator position; when it returns false, verifies the documented fallback (heap
+   * longValues on the same iterator) agrees with per-doc access. Non-contiguous batches must always
+   * return false.
+   */
+  private void assertLongValuesInto(
+      LeafReader leaf, int bitsPerValue, int startDoc, int size, int docStep, long dstByteOffset)
+      throws IOException {
+    int[] docs = new int[size];
+    for (int i = 0; i < size; i++) {
+      docs[i] = startDoc + i * docStep;
+    }
+
+    NumericDocValues values = leaf.getNumericDocValues("numeric");
+    NumericDocValues perDoc = leaf.getNumericDocValues("numeric");
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment dst = arena.allocate(dstByteOffset + size * 8L, 8);
+      boolean decoded = values.longValuesInto(size, docs, 0, dst, dstByteOffset, 0);
+      if (docStep != 1) {
+        assertFalse("non-contiguous docs must not take the segment path", decoded);
+      }
+      if (decoded) {
+        assertEquals(docs[size - 1], values.docID());
+        for (int i = 0; i < size; i++) {
+          assertTrue(perDoc.advanceExact(docs[i]));
+          assertEquals(
+              "bitsPerValue=" + bitsPerValue + " doc=" + docs[i] + " startDoc=" + startDoc,
+              perDoc.longValue(),
+              dst.get(SEGMENT_LONG_LE, dstByteOffset + i * 8L));
+        }
+      } else {
+        // Documented fallback contract: the same iterator must still serve longValues.
+        long[] heap = new long[size];
+        values.longValues(size, docs, heap, 0);
+        assertEquals(docs[size - 1], values.docID());
+        for (int i = 0; i < size; i++) {
+          assertTrue(perDoc.advanceExact(docs[i]));
+          assertEquals(
+              "fallback mismatch bitsPerValue=" + bitsPerValue + " doc=" + docs[i],
+              perDoc.longValue(),
+              heap[i]);
+        }
+      }
+    }
+  }
+
+  public void testConstantNumericLongValuesIntoSegment() throws Exception {
+    // All docs share one value => bitsPerValue == 0 dense branch, which supports the segment
+    // decode unconditionally (no vectorization provider involved).
+    final int numDocs = 256;
+    final long constant = random().nextLong();
+    try (Directory dir = new MMapDirectory(createTempDir("constantLongValuesInto"))) {
+      IndexWriterConfig conf = new IndexWriterConfig(new MockAnalyzer(random()));
+      conf.setMergeScheduler(new SerialMergeScheduler());
+      IndexWriter writer = new IndexWriter(dir, conf);
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new NumericDocValuesField("numeric", constant));
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        NumericDocValues values = reader.leaves().get(0).reader().getNumericDocValues("numeric");
+        int size = 100;
+        int[] docs = new int[size];
+        for (int i = 0; i < size; i++) {
+          docs[i] = 3 + i;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+          MemorySegment dst = arena.allocate(size * 8L, 8);
+          assertTrue(values.longValuesInto(size, docs, 0, dst, 0, 0));
+          assertEquals(docs[size - 1], values.docID());
+          for (int i = 0; i < size; i++) {
+            assertEquals(constant, dst.get(SEGMENT_LONG_LE, i * 8L));
+          }
+        }
+      }
+      writer.close();
+    }
+  }
+
+  public void testLongValuesIntoSegmentFallbackOnHeapDirectory() throws Exception {
+    // ByteBuffersDirectory does not expose MemorySegments: longValuesInto must return false and
+    // the heap longValues fallback must agree with the indexed values.
+    final int numDocs = 256;
+    final long[] expected = new long[numDocs];
+    for (int i = 0; i < numDocs; i++) {
+      expected[i] = random().nextLong() & 0xFFFFL;
+    }
+    try (Directory dir = new ByteBuffersDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig(new MockAnalyzer(random()));
+      conf.setMergeScheduler(new SerialMergeScheduler());
+      IndexWriter writer = new IndexWriter(dir, conf);
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new NumericDocValuesField("numeric", expected[i]));
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        NumericDocValues values = reader.leaves().get(0).reader().getNumericDocValues("numeric");
+        int size = 128;
+        int[] docs = new int[size];
+        for (int i = 0; i < size; i++) {
+          docs[i] = i;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+          MemorySegment dst = arena.allocate(size * 8L, 8);
+          assertFalse(values.longValuesInto(size, docs, 0, dst, 0, 0));
+        }
+        long[] heap = new long[size];
+        values.longValues(size, docs, heap, 0);
+        for (int i = 0; i < size; i++) {
+          assertEquals(expected[i], heap[i]);
+        }
+      }
+      writer.close();
     }
   }
 

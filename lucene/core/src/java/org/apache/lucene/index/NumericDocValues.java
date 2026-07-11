@@ -18,6 +18,7 @@
 package org.apache.lucene.index;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.util.FixedBitSet;
@@ -108,6 +109,36 @@ public abstract class NumericDocValues extends DocValuesIterator {
       }
       values[vi] = value;
     }
+  }
+
+  /**
+   * Bulk-decodes values for {@code size} docs directly into foreign memory. Writes {@code size}
+   * little-endian 8-byte longs to {@code dst} starting at {@code dstByteOffset}. Returns true if
+   * the direct decode was performed; false if this implementation does not support direct segment
+   * decode for these docs &mdash; the caller MUST then fall back to {@link #longValues(int, int[],
+   * int, long[], int, long)}. Same contract as longValues otherwise (docs ascending, no duplicates;
+   * the iterator may advance when true is returned).
+   *
+   * <p>{@code dst} must be a native or heap {@code MemorySegment} of at least {@code dstByteOffset
+   * + size * 8} bytes.
+   *
+   * @param size the number of values to decode
+   * @param docs the buffer of doc IDs whose values should be looked up
+   * @param docsOffset first position in {@code docs} to read
+   * @param dst the destination memory segment
+   * @param dstByteOffset first byte position in {@code dst} to write
+   * @param defaultValue the value to write when a document doesn't have a value
+   * @return true if the direct decode was performed, false if the caller must fall back
+   */
+  public boolean longValuesInto(
+      int size,
+      int[] docs,
+      int docsOffset,
+      MemorySegment dst,
+      long dstByteOffset,
+      long defaultValue)
+      throws IOException {
+    return false;
   }
 
   /**
