@@ -632,6 +632,24 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
   }
 
+  /** Segment twin of {@link #applyTable}: in-place table lookup over decoded packed values. */
+  private static void applyTableToSegment(
+      MemorySegment dst, long dstByteOffset, long[] table, int size) {
+    for (int i = 0; i < size; i++) {
+      long off = dstByteOffset + i * 8L;
+      dst.set(LONG_LE, off, table[(int) dst.get(LONG_LE, off)]);
+    }
+  }
+
+  /** Segment twin of {@link #applyGcdDelta}: in-place {@code v * mul + delta}. */
+  private static void applyGcdDeltaToSegment(
+      MemorySegment dst, long dstByteOffset, long mul, long delta, int size) {
+    for (int i = 0; i < size; i++) {
+      long off = dstByteOffset + i * 8L;
+      dst.set(LONG_LE, off, mul * dst.get(LONG_LE, off) + delta);
+    }
+  }
+
   private static class NumericEntry {
     long[] table;
     int blockShift;
@@ -925,6 +943,26 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                   }
                 }
               }
+
+              @Override
+              public boolean longValuesInto(
+                  int size,
+                  int[] docs,
+                  int docsOffset,
+                  MemorySegment dst,
+                  long dstByteOffset,
+                  long defaultValue)
+                  throws IOException {
+                if (bulkDecodeByteAlignedValuesToSegment(
+                    slice, entry, size, docs, docsOffset, dst, dstByteOffset)) {
+                  applyTableToSegment(dst, dstByteOffset, table, size);
+                  if (size != 0) {
+                    doc = docs[docsOffset + size - 1];
+                  }
+                  return true;
+                }
+                return false;
+              }
             };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
             // Common case for ordinals, which are encoded as numerics
@@ -1022,6 +1060,26 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                     doc = docs[docsOffset + size - 1];
                   }
                 }
+              }
+
+              @Override
+              public boolean longValuesInto(
+                  int size,
+                  int[] docs,
+                  int docsOffset,
+                  MemorySegment dst,
+                  long dstByteOffset,
+                  long defaultValue)
+                  throws IOException {
+                if (bulkDecodeByteAlignedValuesToSegment(
+                    slice, entry, size, docs, docsOffset, dst, dstByteOffset)) {
+                  applyGcdDeltaToSegment(dst, dstByteOffset, mul, delta, size);
+                  if (size != 0) {
+                    doc = docs[docsOffset + size - 1];
+                  }
+                  return true;
+                }
+                return false;
               }
 
               @Override

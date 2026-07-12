@@ -300,9 +300,9 @@ public class TestLucene90DocValuesFormat extends BaseCompressingDocValuesFormatT
   private void doTestDenseNumericLongValuesIntoSegment(int bitsPerValue) throws Exception {
     final int numDocs = 512;
     final long[] expected = new long[numDocs];
-    // Keep values non-negative so the encoder stores them raw (minValue == 0, gcd == 1), the
-    // only dense branch that supports the direct segment decode. Negative values would take the
-    // gcd/delta branch, which falls back.
+    // Non-negative values keep the encoder on the raw branch (minValue == 0, gcd == 1) so this
+    // test pins the untransformed decode; gcd/delta and table encodings are covered by
+    // testGcdDeltaAndTableLongValuesIntoSegment.
     final long mask = bitsPerValue == 64 ? Long.MAX_VALUE : (1L << bitsPerValue) - 1;
     for (int i = 0; i < numDocs; i++) {
       expected[i] = random().nextLong() & mask;
@@ -381,6 +381,52 @@ public class TestLucene90DocValuesFormat extends BaseCompressingDocValuesFormatT
               heap[i]);
         }
       }
+    }
+  }
+
+  public void testGcdDeltaAndTableLongValuesIntoSegment() throws Exception {
+    // Real-data encodings the raw branch never sees (ClickBench regression: UserID has huge
+    // negative values, timestamps share divisors, low-cardinality fields are table-encoded).
+    // gcd/delta: negative + huge magnitudes => minValue != 0.
+    doTestTransformedLongValuesIntoSegment(
+        () -> random().nextLong() / 2 - Long.MAX_VALUE / 4, "gcd-delta-negatives");
+    // gcd branch: common divisor (hour timestamps).
+    doTestTransformedLongValuesIntoSegment(
+        () -> 1_500_000_000_000L + (random().nextInt(100_000)) * 3_600_000L, "gcd-divisor");
+    // table branch: few distinct arbitrary longs (incl. negatives).
+    final long[] tableValues = new long[TestUtil.nextInt(random(), 2, 200)];
+    for (int i = 0; i < tableValues.length; i++) {
+      tableValues[i] = random().nextLong();
+    }
+    doTestTransformedLongValuesIntoSegment(
+        () -> tableValues[random().nextInt(tableValues.length)], "table");
+  }
+
+  private void doTestTransformedLongValuesIntoSegment(
+      java.util.function.LongSupplier gen, String name) throws Exception {
+    final int numDocs = 512;
+    final long[] expected = new long[numDocs];
+    for (int i = 0; i < numDocs; i++) {
+      expected[i] = gen.getAsLong();
+    }
+    try (Directory dir = new MMapDirectory(createTempDir("lvi-" + name))) {
+      IndexWriterConfig conf = new IndexWriterConfig(new MockAnalyzer(random()));
+      conf.setMergeScheduler(new SerialMergeScheduler());
+      IndexWriter writer = new IndexWriter(dir, conf);
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new NumericDocValuesField("numeric", expected[i]));
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        assertLongValuesInto(leaf, -1, 0, 128, 1, 0);
+        assertLongValuesInto(leaf, -1, 17, 128, 1, 0);
+        assertLongValuesInto(leaf, -1, numDocs - 64, 64, 1, 8);
+        assertLongValuesInto(leaf, -1, 0, 128, 2, 0);
+      }
+      writer.close();
     }
   }
 
